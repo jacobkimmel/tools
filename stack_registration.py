@@ -1,4 +1,5 @@
 import numpy as np
+from typing import Union
 try:
     from scipy.optimize import minimize
     from scipy.ndimage import map_coordinates
@@ -13,13 +14,14 @@ except:
     np_tif = None #Won't be able to use the 'debug' option of stack_registration
 
 def stack_registration(
-    s,
-    align_to_this_slice=0,
-    refinement='spike_interpolation',
-    register_in_place=True,
-    fourier_cutoff_radius=None,
-    background_subtraction=None,
-    debug=False,):
+    s: np.ndarray,
+    align_to_this_slice: Union[int, np.ndarray]=0,
+    refinement: str='spike_interpolation',
+    register_in_place: bool=True,
+    fourier_cutoff_radius: float=None,
+    background_subtraction: str=None,
+    remove_cross_artifact: bool=True,
+    debug: bool=False,) -> None:
     """Calculate shifts which would register the slices of a
     three-dimensional stack `s`, and optionally register the stack in-place.
 
@@ -46,18 +48,22 @@ def stack_registration(
     resonable cutoff.
 
     'background_subtraction': One of None, 'mean', 'min', or
-    'edge_mean'. Image registration is sensitive to edge effects. To
-    combat this, we multiply the image by a real-space mask which goes
-    to zero at the edges. For dim images on large DC backgrounds, the
-    registration can end up mistaking this mask for an important image
-    feature, distorting the registration. Sometimes it's helpful to
-    subtract a background from the image before registration, to reduce
-    this effect. 'mean' and 'min' subtract the mean and minimum of the
-    stack 's', respectively, and 'edge_mean' subtracts the mean of the
-    edge pixels. Use None (the default) for no background subtraction.
+    'edge_mean'.
+
+    'remove_cross_artifact': If `True`, applies periodic plus smooth
+    decomposition to remove edge artifacts in Fourier space. Image registration
+    is sensitive to edge effects. The discrete Fourier transform assumes
+    periodicity in the real space image. This assumption is violated by
+    discontinuties at the edge of most images. To combat this, we apply a
+    decomposition technique that separates the periodic and "maximally smooth"
+    components of a real space image, and apply analysis only to the periodic
+    component.
     """
     assert len(s.shape) == 3
     try:
+        # This assert with throw ValueError
+        # if type(align_to_this_slice) == np.ndarray.
+        # Otherwise for out of range int, throw AssertionError
         assert align_to_this_slice in range(s.shape[0])
         align_to_this_slice = s[align_to_this_slice, :, :]
     except ValueError:
@@ -67,35 +73,30 @@ def stack_registration(
     if refinement == 'phase_fitting' and minimize is None:
         raise UserWarning("Failed to import scipy minimize; no phase fitting.")
     assert register_in_place in (True, False)
-    # What background should we subtract from each slice of the stack?
-    assert background_subtraction in (None, 'mean', 'min', 'edge_mean')
-    if background_subtraction is None:
-        bg = 0
-    elif background_subtraction is 'min':
-        bg = s.min()
-    elif background_subtraction is 'mean':
-        bg = s.mean()
-    elif background_subtraction is 'edge_mean':
-        bg = np.mean((s[:, 0, :].mean(), s[:, -1, :].mean(),
-                      s[:, :, 0].mean(), s[:, :, -1].mean()))
+    # TODO delete!
+    bg = 0
+
+    if remove_cross_artifact:
+        # Perform periodic plus smooth decomposition to remove cross artifacts
+        # from the reference slice
+        periodic_ref, smooth_ref = periodic_smooth_decomp(align_to_this_slice)
+
     if fourier_cutoff_radius is None:
-        fourier_cutoff_radius = estimate_fourier_cutoff_radius(s, bg, debug)
+        # Estimate a cutoff radius in Fourier space to separate low freuquency
+        # signals from noise high frequency signals.
+        fourier_cutoff_radius = estimate_fourier_cutoff_radius(periodic_ref,
+            debug, remove_cross_artifact=False)
     assert (0 < fourier_cutoff_radius <= 0.5)
     assert debug in (True, False)
     if debug and np_tif is None:
         raise UserWarning("Failed to import np_tif; no debug mode.")
-    ## Multiply each slice of the stack by an XY mask that goes to zero
-    ## at the edges, to prevent periodic boundary artifacts when we
-    ## Fourier transform.
-    mask_ud = np.sin(np.linspace(0, np.pi, s.shape[1])).reshape(s.shape[1], 1)
-    mask_lr = np.sin(np.linspace(0, np.pi, s.shape[2])).reshape(1, s.shape[2])
-    masked_reference_slice = (align_to_this_slice - bg) * mask_ud * mask_lr
+
     ## We'll base our registration on the phase of the low spatial
     ## frequencies of the cross-power spectrum. We'll need the complex
-    ## conjugate of the Fourier transform of the masked reference slice,
+    ## conjugate of the Fourier transform of the periodic reference slice,
     ## and a mask in the Fourier domain to pick out the low spatial
     ## frequencies:
-    ref_slice_ft_conj = np.conj(np.fft.rfftn(masked_reference_slice))
+    ref_slice_ft_conj = np.conj(np.fft.rfftn(periodic_ref))
     k_ud = np.fft.fftfreq(s.shape[1]).reshape(ref_slice_ft_conj.shape[0], 1)
     k_lr = np.fft.rfftfreq(s.shape[2]).reshape(1, ref_slice_ft_conj.shape[1])
     fourier_mask = (k_ud**2 + k_lr**2) < (fourier_cutoff_radius)**2
@@ -105,17 +106,18 @@ def stack_registration(
     registration_shifts = []
     if debug:
         ## Save some intermediate data to help with debugging
-        masked_stack = np.zeros_like(s)
-        masked_stack_ft = np.zeros(
+        per_stack = np.zeros_like(s)
+        per_stack_ft = np.zeros(
             (s.shape[0],) + ref_slice_ft_conj.shape, dtype=np.complex128)
-        masked_stack_ft_vs_ref = np.zeros_like(masked_stack_ft)
+        per_stack_ft_vs_ref = np.zeros_like(masked_stack_ft)
         cross_power_spectra = np.zeros_like(masked_stack_ft)
         spikes = np.zeros(s.shape, dtype=np.float64)
     for which_slice in range(s.shape[0]):
         if debug: print("Calculating registration for slice", which_slice)
         ## Compute the cross-power spectrum of our slice, and mask out
         ## the high spatial frequencies.
-        current_slice = (s[which_slice, :, :] - bg) * mask_ud * mask_lr
+        # TODO: parallelize PS decomp
+        current_slice, _ = periodic_smooth_decomp(s[which_slice, :, :])
         current_slice_ft = np.fft.rfftn(current_slice)
         cross_power_spectrum = current_slice_ft * ref_slice_ft_conj
         cross_power_spectrum = (fourier_mask *
@@ -159,10 +161,10 @@ def stack_registration(
         registration_shifts.append(loc)
         if debug:
             ## Save some intermediate data to help with debugging
-            masked_stack[which_slice, :, :] = current_slice
-            masked_stack_ft[which_slice, :, :] = (
+            per_stack[which_slice, :, :] = current_slice
+            per_stack_ft[which_slice, :, :] = (
                 np.fft.fftshift(current_slice_ft, axes=0))
-            masked_stack_ft_vs_ref[which_slice, :, :] = (
+            per_stack_ft_vs_ref[which_slice, :, :] = (
                 np.fft.fftshift(current_slice_ft * ref_slice_ft_conj, axes=0))
             cross_power_spectra[which_slice, :, :] = (
                 np.fft.fftshift(cross_power_spectrum, axes=0))
@@ -193,13 +195,27 @@ def stack_registration(
 mr_stacky = stack_registration #I like calling it this.
 
 def apply_registration_shifts(
-    s,
-    registration_shifts,
-    registration_type='fourier_interpolation',
-    edges='zero',
-    ):
+    s: np.ndarray,
+    registration_shifts: list,
+    registration_type: str='fourier_interpolation',
+    edges: str='zero',) -> None:
     """Modify the input stack `s` in-place so it's registered.
 
+    Parameters
+    ----------
+    s : np.ndarray
+        [Z, H, W] image stack.
+    registration_shifts : list
+        [Z,] shifts for registering images in `s`.
+    registration_type : str
+        One of ('fourier_interpolation', 'nearest_integer').
+
+    Returns
+    -------
+    None. `s` is modified in-place.
+
+    Notes
+    -----
     If you used `stack_registration` to calculate `registration_shifts`
     for the stack `s`, but didn't use the `register_in_place` option to
     apply the registration correction, you can use this function to
@@ -466,10 +482,31 @@ def expected_cross_power_spectrum(shift, k_ud, k_lr):
     shift_ud, shift_lr = shift
     return np.exp(-2j*np.pi*(k_ud*shift_ud + k_lr*shift_lr))
 
-def estimate_fourier_cutoff_radius(s, bg=0, debug=False):
+def estimate_fourier_cutoff_radius(s: np.ndarray,
+                                debug: bool=False,
+                                remove_cross_artifact: bool=False) -> float:
     """Estimate the radius in the Fourier domain which divides signal
     from pure noise.
 
+    Parameters
+    ----------
+    s : np.ndarray
+        [H, W] real space reference image. tolerates [Z, H, W] if passed.
+    debug : bool
+        debugging mode verbosity.
+    remove_cross_artifact : bool
+        apply periodic & smooth decomposition to remove the cross artifact.
+        If `False`, assumes the cross artifact has already been removed by
+        some means.
+
+    Returns
+    -------
+    cutoff_radius : float
+        radius from the DC term in Fourier space to consider as useful low
+        frequency signal.
+
+    Notes
+    -----
     The Fourier transform amplitudes of most microscope images show a
     clear circular edge, outside of which there is no signal. This
     function tries to estimate the position of this edge. The estimation
@@ -479,13 +516,13 @@ def estimate_fourier_cutoff_radius(s, bg=0, debug=False):
     # We only need one slice for this estimate:
     if len(s.shape) == 3: s = s[0, :, :]
     assert len(s.shape) == 2
-    s = s - bg # Background subtraction
-    # Mask `s` to avoid fourier-domain artifacts:
-    mask_ud = np.sin(np.linspace(0, np.pi, s.shape[0])).reshape(s.shape[0], 1)
-    mask_lr = np.sin(np.linspace(0, np.pi, s.shape[1])).reshape(1, s.shape[1])
-    s = s * mask_ud * mask_lr
+    if remove_cross_artifact: # perform periodic plus smooth decomposition
+        periodic, smooth = periodic_smooth_decomp(s)
+        s = periodic # analyze only the periodic component
     # We use pixels in the 'corners' of the Fourier domain to estimate
-    # our noise floor:
+    # our noise floor. This is principled if the image
+    # is bandlimited per Nyquist, but not as analytically defensible otherwise.
+    # However, it seems to work in practice for many non-bandlimited images.
     k_ud, k_lr = np.fft.fftfreq(s.shape[-2]), np.fft.rfftfreq(s.shape[-1])
     k_ud, k_lr = k_ud.reshape(k_ud.size, 1), k_lr.reshape(1, k_lr.size)
     ft_radius = np.sqrt(k_ud**2 + k_lr**2)
@@ -493,7 +530,7 @@ def estimate_fourier_cutoff_radius(s, bg=0, debug=False):
     ft_mag = np.abs(np.fft.rfftn(s))
     noise_floor = np.median(ft_mag[deplorables])
     # We use the brightest pixels in the Fourier domain (except the DC
-    # term) to estimate the peak signal:
+    # term) to estimate the peak signal.
     ft_mag[0, 0] = 0
     peak_signal = ft_mag.max()
     # Our cutoff radius is the highest spatial frequency with an
@@ -541,6 +578,83 @@ def coinflip_split(a, photoelectrons_per_count):
     # gets assigned to:
     out_1 = np.random.binomial(photoelectrons, 0.5)
     return out_1, photoelectrons - out_1
+
+# Periodic plus smooth image decomposition
+
+def periodic_smooth_decomp(I: np.ndarray) -> (np.ndarray, np.ndarray):
+    '''Performs periodic-smooth image decomposition
+
+    Parameters
+    ----------
+    I : np.ndarray
+        [M, N] image. will be coerced to a float.
+
+    Returns
+    -------
+    P : np.ndarray
+        [M, N] image, float. periodic portion.
+    S : np.ndarray
+        [M, N] image, float. smooth portion.
+
+    References
+    ----------
+    Periodic Plus Smooth Image Decomposition
+    Moisan, L. J Math Imaging Vis (2011) 39: 161.
+    doi.org/10.1007/s10851-010-0227-1
+    '''
+    u = I.astype(np.float64)
+    v = u2v(u)
+    v_fft = np.fft.fftn(v)
+    s = v2s(v_fft)
+    s_i = np.fft.ifftn(s)
+    s_f = np.real(s_i)
+    p = u - s_f # u = p + s
+    return p, s_f
+
+def u2v(u: np.ndarray) -> np.ndarray:
+    '''Converts the image `u` into the image `v`
+
+    Parameters
+    ----------
+    u : np.ndarray
+        [M, N] image
+
+    Returns
+    -------
+    v : np.ndarray
+        [M, N] image, zeroed expect for the outermost rows and cols
+    '''
+    v = np.zeros(u.shape, dtype=u.dtype)
+
+    v[0, :] = u[-1, :] - u[0,  :]
+    v[-1,:] = u[0,  :] - u[-1, :]
+
+    v[:,  0] += u[:, -1] - u[:,  0]
+    v[:, -1] += u[:,  0] - u[:, -1]
+    return v
+
+def v2s(v_hat: np.ndarray) -> np.ndarray:
+    '''Computes the maximally smooth component of `u`, `s` from `v`
+
+
+    s[q, r] = v[q, r] / (2*np.cos( (2*np.pi*q)/M )
+        + 2*np.cos( (2*np.pi*r)/N ) - 4)
+
+    Parameters
+    ----------
+    v_hat : np.ndarray
+        [M, N] DFT of v
+    '''
+    M, N = v_hat.shape
+
+    q = np.arange(M).reshape(M, 1).astype(v_hat.dtype)
+    r = np.arange(N).reshape(1, N).astype(v_hat.dtype)
+
+    den = (2*np.cos( np.divide((2*np.pi*q), M) ) \
+         + 2*np.cos( np.divide((2*np.pi*r), N) ) - 4)
+    s = np.divide(v_hat, den, out=np.zeros_like(v_hat), where=den!=0)
+    s[0, 0] = 0
+    return s
 
 if __name__ == '__main__':
     try:
@@ -605,8 +719,8 @@ if __name__ == '__main__':
               '%0.2f (%i)'%(cs[1] * bucket_size[2], s[1]))
 
     # Now we test rotational alignment, on top of translational alignment
-    input("Hit enter to test rotational registration...\n" + 
-          " (This will overwrite some of the DEBUG_* files" + 
+    input("Hit enter to test rotational registration...\n" +
+          " (This will overwrite some of the DEBUG_* files" +
           " from translational registration)")
     print("Creating rotated and shifted stack from test object...")
     angles_deg = [180*np.random.random()-90 for s in shifts]
